@@ -1,6 +1,4 @@
 using System.Collections.Concurrent;
-using System.Drawing;
-using System.Drawing.Imaging;
 using System.Text;
 using Microsoft.Extensions.Options;
 using OsmondLocalApi.Models;
@@ -496,10 +494,8 @@ public sealed class OsmondReaderService : IOsmondReaderService, IHostedService, 
     {
         try
         {
-            var image = document.GetField(source, fieldId).GetImage().ToBitmap();
-            using var memory = new MemoryStream();
-            image.Save(memory, ImageFormat.Jpeg);
-            return Convert.ToBase64String(memory.ToArray());
+            var jpegData = document.GetField(source, fieldId).GetImage().Save(Image.FileFormat.Jpeg);
+            return Convert.ToBase64String(jpegData.GetBytes());
         }
         catch
         {
