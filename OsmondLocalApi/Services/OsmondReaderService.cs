@@ -175,6 +175,16 @@ public sealed class OsmondReaderService : IOsmondReaderService, IHostedService, 
             var reader = TryConnectCard(out var card);
             if (reader is null || card is null)
             {
+                MergeFinalFields(vizDoc);
+                var hasVisualData = HasVisualData(_workingResponse);
+                if (hasVisualData)
+                {
+                    _workingResponse.Ok = true;
+                    _workingResponse.InternalCode = ResponseCode.Ok;
+                    _workingResponse.Message = "Visual read completed; no chip document detected.";
+                    return _workingResponse;
+                }
+
                 return ReadResponse.Failure(ResponseCode.NoDocument, "No document detected on any reader.");
             }
 
@@ -296,6 +306,12 @@ public sealed class OsmondReaderService : IOsmondReaderService, IHostedService, 
         {
             try
             {
+                var cards = reader.GetCards();
+                if (cards.Count == 0)
+                {
+                    continue;
+                }
+
                 card = reader.ConnectCard(0);
                 return reader;
             }
@@ -441,6 +457,15 @@ public sealed class OsmondReaderService : IOsmondReaderService, IHostedService, 
         var surname = SafeFieldValue(vizDoc, FieldSource.Mrz, FieldId.Surname);
         var givenName = SafeFieldValue(vizDoc, FieldSource.Mrz, FieldId.Name);
         return string.Join(" ", new[] { surname, givenName }.Where(static x => !string.IsNullOrWhiteSpace(x))).Trim();
+    }
+
+    private static bool HasVisualData(ReadResponse response)
+    {
+        return !string.IsNullOrWhiteSpace(response.Raw.Mrz)
+               || !string.IsNullOrWhiteSpace(response.Raw.Barcode)
+               || !string.IsNullOrWhiteSpace(response.Fields.DocNo)
+               || !string.IsNullOrWhiteSpace(response.Fields.FullNameLat)
+               || !string.IsNullOrWhiteSpace(response.Fields.Dob);
     }
 
     private static string NormalizeDate(string value)
