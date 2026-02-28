@@ -1,14 +1,50 @@
 # OsmondLocalApi
 
-Windows Service (.NET 8, x64) that exposes a local-only HTTP API to read Algerian biometric ID cards and passports through Adaptive Recognition `pr-sdk-2.2` with Osmond-R-V2 USB reader.
+Windows Service (.NET 8, x64) exposing local-only HTTP API for Algerian biometric ID/passport reading through Adaptive Recognition `pr-sdk-2.2` and Osmond R V2.
 
-## API
+## Runtime requirements
 
-### POST `/read`
-- URL: `http://127.0.0.1:8765/read`
-- Optional header: `X-API-Key` (required only when configured in appsettings)
+- Windows 10/11 x64
+- Passport Reader Software installed
+- `pr-sdk-2.2` .NET assemblies available
+- Reader connected via USB
 
-Response format:
+## Project structure
+
+- `Program.cs`: Minimal API + Windows Service hosting + ProgramData config/logging
+- `Services/OsmondReaderService.cs`: PR22 lifecycle orchestration (scan/analyze/auth/read/extract)
+- `Models/ReadResponse.cs`: required output schema
+
+## Configuration
+
+File path:
+
+`%ProgramData%\OsmondLocalApi\appsettings.json`
+
+```json
+{
+  "port": 8765,
+  "timeoutSeconds": 10,
+  "includePhoto": true,
+  "deviceName": "Osmond R V2 SN1234",
+  "apiKey": "optional-api-key"
+}
+```
+
+## Logging
+
+Daily rolling logs written to:
+
+`%ProgramData%\OsmondLocalApi\logs`
+
+## Endpoint
+
+### POST `http://127.0.0.1:8765/read`
+
+- Optional header: `X-API-Key` (required when configured)
+- If read already in progress: HTTP 409 + `READ_IN_PROGRESS`
+
+### Response
 
 ```json
 {
@@ -37,36 +73,37 @@ Response format:
 }
 ```
 
-## Configuration
+## PR22 integration behavior implemented
 
-Create/edit:
+- Device opened on startup and reused.
+- Read pipeline:
+  1) Scan White + Infra
+  2) Analyze MRZ + VIZ
+  3) Start `ECardTask` with `AuthLevel.Full` and `FileId.All`
+  4) Handle `AuthBegin`, `AuthWaitForInput`, `AuthFinished`
+  5) Await `ReadFinished(FileId.All)` via `TaskCompletionSource`
+  6) Extract output fields and raw values
+- Chip auth failure returns `READ_FAILED`.
+- Photo selection priority: DG2 face (`FieldSource.ECard`) then fallback VIZ face.
 
-`%ProgramData%\OsmondLocalApi\appsettings.json`
+## SDK binary placement
 
-```json
-{
-  "port": 8765,
-  "timeoutSeconds": 10,
-  "includePhoto": true,
-  "deviceName": "Osmond R V2 SN1234",
-  "apiKey": "optional-api-key"
-}
-```
+Put these files under:
 
-Logs are written to:
+`lib\pr-sdk-2.2\`
 
-`%ProgramData%\OsmondLocalApi\logs`
+- `Pr22.dll`
+- `Pr22.Processing.dll`
 
-## Publish (self-contained x64)
+## Publish self-contained x64
 
 ```powershell
 dotnet restore
 dotnet publish .\OsmondLocalApi.csproj -c Release -r win-x64 --self-contained true /p:PublishSingleFile=true -o .\publish
 ```
 
-## Register as Windows Service (sc.exe)
-
-> Run elevated PowerShell/CMD.
+}0211
+47## Register Windows Service (sc.exe)
 
 ```powershell
 sc.exe create OsmondLocalApi binPath= "C:\Program Files\OsmondLocalApi\OsmondLocalApi.exe" start= auto
@@ -74,36 +111,7 @@ sc.exe description OsmondLocalApi "Local API for Algerian eID/passport read via 
 sc.exe start OsmondLocalApi
 ```
 
-To update service binary:
-
-```powershell
-sc.exe stop OsmondLocalApi
-# replace binary
-sc.exe start OsmondLocalApi
-```
-
-To remove:
-
-```powershell
-sc.exe stop OsmondLocalApi
-sc.exe delete OsmondLocalApi
-```
-
-## Integration notes (pr-sdk-2.2)
-
-`Services/OsmondReaderService.cs` includes the exact orchestration points expected by production integration:
-- `AuthBegin`
-- `AuthWaitForInput`
-- `AuthFinished`
-- await `ReadFinished(FileId.All)` via `TaskCompletionSource`
-- always perform chip authentication and chip DG read
-- image selection priority `DG2` face then fallback to VIZ face
-
-Replace the `PrSdkGateway` placeholder with your concrete SDK calls based on installed SDK API signatures.
-
-## Usage examples
-
-### PHP (cURL)
+## PHP cURL example
 
 ```php
 <?php
@@ -115,37 +123,24 @@ curl_setopt($ch, CURLOPT_HTTPHEADER, [
     'X-API-Key: optional-api-key'
 ]);
 curl_setopt($ch, CURLOPT_POSTFIELDS, '{}');
-
 $response = curl_exec($ch);
-$httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+$status = curl_getinfo($ch, CURLINFO_HTTP_CODE);
 curl_close($ch);
 
-echo "HTTP $httpCode\n";
+echo "HTTP $status\n";
 echo $response;
 ```
 
-### Python (Odoo / requests)
+## Python (Odoo requests) example
 
-```python
+```p2ython
 import requests
 
-url = "http://127.0.0.1:8765/read"
-headers = {
-    "X-API-Key": "optional-api-key",
-    "Content-Type": "application/json",
-}
-
-resp = requests.post(url, json={}, headers=headers, timeout=20)
-resp.raise_for_status()
-payload = resp.json()
-
-if payload.get("ok"):
-    partner_vals = {
-        "name": payload["fields"].get("full_name_lat") or payload["fields"].get("full_name_ar"),
-        "x_nin": payload["fields"].get("nin"),
-        "x_doc_no": payload["fields"].get("doc_no"),
-    }
-    print("Ready for Odoo create/write:", partner_vals)
-else:
-    print("Read failed:", payload.get("code"), payload.get("message"))
+resp = requests.post(
+    "http://127.0.0.1:8765/read",
+    json={},
+    headers={"X-API-Key": "optional-api-key"},
+    timeout=20,
+)
+print(resp.status_code, resp.json())
 ```

@@ -19,14 +19,20 @@
   </ItemGroup>
 
   <!--
-    Place pr-sdk-2.2 binaries in /lib/pr-sdk-2.2 and uncomment the references below
-    if your SDK is not available in the GAC or installation folder.
+    Required SDK references (pr-sdk-2.2):
+    - Pr22.dll
+    - Pr22.Processing.dll
 
+    Copy SDK binaries to lib\pr-sdk-2.2 and keep this section enabled.
+  -->
   <ItemGroup>
-    <Reference Include="prsdk">
-      <HintPath>lib\pr-sdk-2.2\prsdk.dll</HintPath>
+    <Reference Include="Pr22">
+      <HintPath>lib\pr-sdk-2.2\Pr22.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="Pr22.Processing">
+      <HintPath>lib\pr-sdk-2.2\Pr22.Processing.dll</HintPath>
       <Private>true</Private>
     </Reference>
   </ItemGroup>
-  -->
 </Project>
