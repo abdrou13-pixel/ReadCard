@@ -35,11 +35,23 @@ public sealed class OsmondReaderService : IOsmondReaderService, IHostedService, 
     private readonly object _resultLock = new();
     private ReadResponse _workingResponse = new();
     private volatile bool _authFailed;
+    private volatile bool _started;
 
     public OsmondReaderService(ILogger<OsmondReaderService> logger, IOptionsMonitor<AppConfig> config)
     {
         _logger = logger;
         _config = config;
+    }
+
+
+    public Task InitializeAsync(CancellationToken cancellationToken)
+    {
+        if (_started)
+        {
+            return Task.CompletedTask;
+        }
+
+        return StartAsync(cancellationToken);
     }
 
     public Task StartAsync(CancellationToken cancellationToken)
@@ -56,15 +68,18 @@ public sealed class OsmondReaderService : IOsmondReaderService, IHostedService, 
             _pr.FileChecked += OnFileChecked;
 
             TryOpenConfiguredDevice();
+            _started = true;
         }
         catch (DllNotFoundException ex)
         {
             _deviceReady = false;
+            _started = false;
             _logger.LogError(ex, "Pr22 SDK is not installed correctly or has wrong bitness.");
         }
         catch (Exception ex)
         {
             _deviceReady = false;
+            _started = false;
             _logger.LogError(ex, "Unable to initialize reader service.");
         }
 
@@ -112,6 +127,7 @@ public sealed class OsmondReaderService : IOsmondReaderService, IHostedService, 
             }
         }
 
+        _started = false;
         return Task.CompletedTask;
     }
 
@@ -485,6 +501,7 @@ public sealed class OsmondReaderService : IOsmondReaderService, IHostedService, 
             if (!_deviceReady)
             {
                 TryOpenConfiguredDevice();
+            _started = true;
             }
 
             return;
