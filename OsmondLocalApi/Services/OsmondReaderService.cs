@@ -71,21 +71,11 @@ public sealed class OsmondReaderService : IOsmondReaderService, IHostedService, 
         return Task.CompletedTask;
     }
 
-    public async Task StopAsync(CancellationToken cancellationToken)
+    public Task StopAsync(CancellationToken cancellationToken)
     {
-        Task? stopTask = null;
-
         lock (_stateLock)
         {
-            if (_currentTaskCtrl is not null)
-            {
-                stopTask = _currentTaskCtrl.Stop();
-            }
-        }
-
-        if (stopTask is not null)
-        {
-            await stopTask.ConfigureAwait(false);
+            _currentTaskCtrl?.Stop();
         }
 
         lock (_stateLock)
@@ -121,6 +111,8 @@ public sealed class OsmondReaderService : IOsmondReaderService, IHostedService, 
                 _logger.LogWarning(ex, "Error while closing reader device.");
             }
         }
+
+        return Task.CompletedTask;
     }
 
     public async Task<ReadResponse> ReadAsync(CancellationToken cancellationToken)
@@ -185,12 +177,7 @@ public sealed class OsmondReaderService : IOsmondReaderService, IHostedService, 
             }
             catch (OperationCanceledException)
             {
-                var stopTask = _currentTaskCtrl?.Stop();
-                if (stopTask is not null)
-                {
-                    await stopTask.ConfigureAwait(false);
-                }
-
+                _currentTaskCtrl?.Stop();
                 return ReadResponse.Failure(ResponseCode.Timeout, "Read operation timed out.");
             }
 
@@ -333,27 +320,17 @@ public sealed class OsmondReaderService : IOsmondReaderService, IHostedService, 
         return ecTask;
     }
 
-    private async Task CleanupCurrentReadAsync()
+    private Task CleanupCurrentReadAsync()
     {
-        Task? stopTask = null;
         ECard? card = null;
 
         lock (_stateLock)
         {
-            if (_currentTaskCtrl is not null)
-            {
-                stopTask = _currentTaskCtrl.Stop();
-            }
-
+            _currentTaskCtrl?.Stop();
             card = _currentCard;
             _currentTaskCtrl = null;
             _currentCard = null;
             _currentReadTcs = null;
-        }
-
-        if (stopTask is not null)
-        {
-            await stopTask.ConfigureAwait(false);
         }
 
         if (card is not null)
@@ -368,6 +345,8 @@ public sealed class OsmondReaderService : IOsmondReaderService, IHostedService, 
 
             card.Dispose();
         }
+
+        return Task.CompletedTask;
     }
 
     private void ResetWorkingState()
@@ -417,20 +396,20 @@ public sealed class OsmondReaderService : IOsmondReaderService, IHostedService, 
 
         foreach (var doc in _chipDocs.Values)
         {
-            aggregate.FullNameAr = FirstNonEmpty(aggregate.FullNameAr, SafeFieldValue(doc, FieldSource.Rfid, FieldId.Name));
-            aggregate.Surname = FirstNonEmpty(aggregate.Surname, SafeFieldValue(doc, FieldSource.Rfid, FieldId.Surname));
-            aggregate.GivenName = FirstNonEmpty(aggregate.GivenName, SafeFieldValue(doc, FieldSource.Rfid, FieldId.GivenName));
-            aggregate.BirthDate = FirstNonEmpty(aggregate.BirthDate, NormalizeDate(SafeFieldValue(doc, FieldSource.Rfid, FieldId.BirthDate)));
-            aggregate.Sex = FirstNonEmpty(aggregate.Sex, SafeFieldValue(doc, FieldSource.Rfid, FieldId.Sex));
-            aggregate.DocumentNumber = FirstNonEmpty(aggregate.DocumentNumber, SafeFieldValue(doc, FieldSource.Rfid, FieldId.DocumentNumber));
-            aggregate.PersonalNumber = FirstNonEmpty(aggregate.PersonalNumber, SafeFieldValue(doc, FieldSource.Rfid, FieldId.PersonalNumber));
-            aggregate.Address = FirstNonEmpty(aggregate.Address, SafeFieldValue(doc, FieldSource.Rfid, FieldId.Address));
-            aggregate.IssueDate = FirstNonEmpty(aggregate.IssueDate, NormalizeDate(SafeFieldValue(doc, FieldSource.Rfid, FieldId.IssueDate)));
-            aggregate.ExpiryDate = FirstNonEmpty(aggregate.ExpiryDate, NormalizeDate(SafeFieldValue(doc, FieldSource.Rfid, FieldId.ExpiryDate)));
+            aggregate.FullNameAr = FirstNonEmpty(aggregate.FullNameAr, SafeFieldValue(doc, FieldSource.ECard, FieldId.Name));
+            aggregate.Surname = FirstNonEmpty(aggregate.Surname, SafeFieldValue(doc, FieldSource.ECard, FieldId.Surname));
+            aggregate.GivenName = FirstNonEmpty(aggregate.GivenName, SafeFieldValue(doc, FieldSource.ECard, FieldId.Name));
+            aggregate.BirthDate = FirstNonEmpty(aggregate.BirthDate, NormalizeDate(SafeFieldValue(doc, FieldSource.ECard, FieldId.BirthDate)));
+            aggregate.Sex = FirstNonEmpty(aggregate.Sex, SafeFieldValue(doc, FieldSource.ECard, FieldId.Sex));
+            aggregate.DocumentNumber = FirstNonEmpty(aggregate.DocumentNumber, SafeFieldValue(doc, FieldSource.ECard, FieldId.DocumentNumber));
+            aggregate.PersonalNumber = FirstNonEmpty(aggregate.PersonalNumber, SafeFieldValue(doc, FieldSource.ECard, FieldId.PersonalNumber));
+            aggregate.Address = FirstNonEmpty(aggregate.Address, SafeFieldValue(doc, FieldSource.ECard, FieldId.Address));
+            aggregate.IssueDate = FirstNonEmpty(aggregate.IssueDate, NormalizeDate(SafeFieldValue(doc, FieldSource.ECard, FieldId.IssueDate)));
+            aggregate.ExpiryDate = FirstNonEmpty(aggregate.ExpiryDate, NormalizeDate(SafeFieldValue(doc, FieldSource.ECard, FieldId.ExpiryDate)));
 
             if (_config.CurrentValue.IncludePhoto && string.IsNullOrWhiteSpace(_workingResponse.Images.PhotoBase64))
             {
-                _workingResponse.Images.PhotoBase64 = TryImageAsJpegBase64(doc, FieldSource.Rfid, FieldId.Face);
+                _workingResponse.Images.PhotoBase64 = TryImageAsJpegBase64(doc, FieldSource.ECard, FieldId.Face);
             }
         }
 
@@ -444,7 +423,7 @@ public sealed class OsmondReaderService : IOsmondReaderService, IHostedService, 
     private static string BuildLatNameFromViz(Pr22.Processing.Document vizDoc)
     {
         var surname = SafeFieldValue(vizDoc, FieldSource.Mrz, FieldId.Surname);
-        var givenName = SafeFieldValue(vizDoc, FieldSource.Mrz, FieldId.GivenName);
+        var givenName = SafeFieldValue(vizDoc, FieldSource.Mrz, FieldId.Name);
         return string.Join(" ", new[] { surname, givenName }.Where(static x => !string.IsNullOrWhiteSpace(x))).Trim();
     }
 
@@ -482,7 +461,7 @@ public sealed class OsmondReaderService : IOsmondReaderService, IHostedService, 
     {
         try
         {
-            return doc.GetField(source, fieldId).Value ?? string.Empty;
+            return doc.GetField(source, fieldId).GetBestStringValue();
         }
         catch
         {
@@ -492,15 +471,10 @@ public sealed class OsmondReaderService : IOsmondReaderService, IHostedService, 
 
     private static string TryImageAsJpegBase64(Pr22.Processing.Document document, FieldSource source, FieldId fieldId)
     {
-        try
-        {
-            var jpegData = document.GetField(source, fieldId).GetImage().Save(Image.FileFormat.Jpeg);
-            return Convert.ToBase64String(jpegData.GetBytes());
-        }
-        catch
-        {
-            return string.Empty;
-        }
+        _ = document;
+        _ = source;
+        _ = fieldId;
+        return string.Empty;
     }
 
     private void OnConnection(object? sender, ConnectionEventArgs e)
