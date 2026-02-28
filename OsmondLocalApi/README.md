@@ -102,7 +102,8 @@ dotnet restore
 dotnet publish .\OsmondLocalApi.csproj -c Release -r win-x64 --self-contained true /p:PublishSingleFile=true -o .\publish
 ```
 
-## Register Windows Service (sc.exe)
+}0211
+47## Register Windows Service (sc.exe)
 
 ```powershell
 sc.exe create OsmondLocalApi binPath= "C:\Program Files\OsmondLocalApi\OsmondLocalApi.exe" start= auto
@@ -132,7 +133,7 @@ echo $response;
 
 ## Python (Odoo requests) example
 
-```python
+```p2ython
 import requests
 
 resp = requests.post(
