@@ -2,12 +2,14 @@ using System.Text.Json.Serialization;
 
 namespace OsmondLocalApi.Models;
 
-public enum ErrorCode
+public enum ResponseCode
 {
-    None,
+    Ok,
     DeviceNotFound,
     DeviceOpenFailed,
     NoDocument,
+    AuthFailed,
+    ChipReadFailed,
     ReadFailed,
     Timeout,
     ReadInProgress,
@@ -20,10 +22,23 @@ public sealed class ReadResponse
     public bool Ok { get; set; }
 
     [JsonPropertyName("code")]
-    public string Code => ToApiCode(InternalCode);
+    public string Code => InternalCode switch
+    {
+        ResponseCode.Ok => "OK",
+        ResponseCode.DeviceNotFound => "DEVICE_NOT_FOUND",
+        ResponseCode.DeviceOpenFailed => "DEVICE_OPEN_FAILED",
+        ResponseCode.NoDocument => "NO_DOCUMENT",
+        ResponseCode.AuthFailed => "AUTH_FAILED",
+        ResponseCode.ChipReadFailed => "CHIP_READ_FAILED",
+        ResponseCode.ReadFailed => "READ_FAILED",
+        ResponseCode.Timeout => "TIMEOUT",
+        ResponseCode.ReadInProgress => "READ_IN_PROGRESS",
+        ResponseCode.Unauthorized => "UNAUTHORIZED",
+        _ => "READ_FAILED"
+    };
 
     [JsonIgnore]
-    public ErrorCode InternalCode { get; set; } = ErrorCode.None;
+    public ResponseCode InternalCode { get; set; } = ResponseCode.Ok;
 
     [JsonPropertyName("message")]
     public string Message { get; set; } = string.Empty;
@@ -37,16 +52,11 @@ public sealed class ReadResponse
     [JsonPropertyName("images")]
     public ImagePayload Images { get; set; } = new();
 
-    private static string ToApiCode(ErrorCode code) => code switch
+    public static ReadResponse Failure(ResponseCode code, string message) => new()
     {
-        ErrorCode.DeviceNotFound => "DEVICE_NOT_FOUND",
-        ErrorCode.DeviceOpenFailed => "DEVICE_OPEN_FAILED",
-        ErrorCode.NoDocument => "NO_DOCUMENT",
-        ErrorCode.ReadFailed => "READ_FAILED",
-        ErrorCode.Timeout => "TIMEOUT",
-        ErrorCode.ReadInProgress => "READ_IN_PROGRESS",
-        ErrorCode.Unauthorized => "UNAUTHORIZED",
-        _ => string.Empty
+        Ok = false,
+        InternalCode = code,
+        Message = message
     };
 }
 

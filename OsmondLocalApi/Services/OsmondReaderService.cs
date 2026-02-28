@@ -1,5 +1,8 @@
+using System.Collections.Concurrent;
+using System.Drawing;
+using System.Drawing.Imaging;
+using System.Text;
 using Microsoft.Extensions.Options;
-using OsmondLocalApi.Config;
 using OsmondLocalApi.Models;
 using Pr22;
 using Pr22.ECardHandling;
@@ -11,469 +14,629 @@ using Pr22.Task;
 
 namespace OsmondLocalApi.Services;
 
-public sealed class OsmondReaderService : IOsmondReaderService, IDisposable
+public sealed class OsmondReaderService : IOsmondReaderService, IHostedService, IDisposable
 {
-    private readonly SemaphoreSlim _readLock = new(1, 1);
-    private readonly object _sync = new();
     private readonly ILogger<OsmondReaderService> _logger;
-    private readonly IOptionsMonitor<AppSettings> _settings;
+    private readonly IOptionsMonitor<AppConfig> _config;
+    private readonly SemaphoreSlim _readSemaphore = new(1, 1);
+    private readonly object _stateLock = new();
 
-    private DocumentReaderDevice? _device;
-    private ECard? _card;
-    private ECardReader? _reader;
-    private TaskControl? _readControl;
-    private TaskCompletionSource<GatewayReadResult>? _readFinishedTcs;
-    private Processing.Document? _vizResult;
-    private volatile bool _initialized;
+    private DocumentReaderDevice? _pr;
+    private bool _deviceReady;
 
-    public OsmondReaderService(ILogger<OsmondReaderService> logger, IOptionsMonitor<AppSettings> settings)
+    private ECard? _currentCard;
+    private TaskControl? _currentTaskCtrl;
+    private TaskCompletionSource<bool>? _currentReadTcs;
+
+    private string? _mrzString;
+    private string? _canString;
+
+    private readonly ConcurrentDictionary<string, Pr22.Processing.Document> _chipDocs = new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> _requestedFiles = new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> _receivedFiles = new(StringComparer.OrdinalIgnoreCase);
+    private readonly object _resultLock = new();
+    private ReadResponse _workingResponse = new();
+    private volatile bool _authFailed;
+
+    public OsmondReaderService(ILogger<OsmondReaderService> logger, IOptionsMonitor<AppConfig> config)
     {
         _logger = logger;
-        _settings = settings;
+        _config = config;
     }
 
-    public async Task InitializeAsync(CancellationToken cancellationToken)
+    public Task StartAsync(CancellationToken cancellationToken)
     {
-        if (_initialized)
+        try
         {
-            return;
+            _pr = new DocumentReaderDevice();
+            _pr.Connection += OnConnection;
+            _pr.AuthBegin += OnAuthBegin;
+            _pr.AuthFinished += OnAuthFinished;
+            _pr.AuthWaitForInput += OnAuthWaitForInput;
+            _pr.ReadBegin += OnReadBegin;
+            _pr.ReadFinished += OnReadFinished;
+            _pr.FileChecked += OnFileChecked;
+
+            TryOpenConfiguredDevice();
+        }
+        catch (DllNotFoundException ex)
+        {
+            _deviceReady = false;
+            _logger.LogError(ex, "Pr22 SDK is not installed correctly or has wrong bitness.");
+        }
+        catch (Exception ex)
+        {
+            _deviceReady = false;
+            _logger.LogError(ex, "Unable to initialize reader service.");
         }
 
-        await Task.Yield();
-        lock (_sync)
+        return Task.CompletedTask;
+    }
+
+    public async Task StopAsync(CancellationToken cancellationToken)
+    {
+        Task? stopTask = null;
+
+        lock (_stateLock)
         {
-            if (_initialized)
+            if (_currentTaskCtrl is not null)
             {
-                return;
+                stopTask = _currentTaskCtrl.Stop();
+            }
+        }
+
+        if (stopTask is not null)
+        {
+            await stopTask.ConfigureAwait(false);
+        }
+
+        lock (_stateLock)
+        {
+            if (_currentCard is not null)
+            {
+                try
+                {
+                    _currentCard.Disconnect();
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Card disconnect failed during stop.");
+                }
+
+                _currentCard.Dispose();
+                _currentCard = null;
             }
 
+            _currentTaskCtrl = null;
+            _currentReadTcs = null;
+        }
+
+        if (_pr is not null)
+        {
             try
             {
-                _device = new DocumentReaderDevice();
-                _device.Connection += OnConnection;
-                _device.AuthBegin += OnAuthBegin;
-                _device.AuthFinished += OnAuthFinished;
-                _device.AuthWaitForInput += OnAuthWaitForInput;
-                _device.ReadBegin += OnReadBegin;
-                _device.ReadFinished += OnReadFinished;
-                _device.FileChecked += OnFileChecked;
-
-                OpenConfiguredDevice();
-                _initialized = true;
-                _logger.LogInformation("Reader SDK initialized and device opened.");
+                _pr.Close();
+                _logger.LogInformation("Reader device closed.");
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "SDK initialization failed.");
-                _initialized = false;
+                _logger.LogWarning(ex, "Error while closing reader device.");
             }
         }
     }
 
     public async Task<ReadResponse> ReadAsync(CancellationToken cancellationToken)
     {
-        if (!await _readLock.WaitAsync(0, cancellationToken))
+        if (!await _readSemaphore.WaitAsync(0, cancellationToken).ConfigureAwait(false))
         {
-            return Error(ErrorCode.ReadInProgress, "Another read operation is already running.");
+            return ReadResponse.Failure(ResponseCode.ReadInProgress, "A read operation is already running.");
         }
 
         try
         {
-            if (!_initialized)
+            if (!_deviceReady || _pr is null)
             {
-                await InitializeAsync(cancellationToken);
+                return ReadResponse.Failure(ResponseCode.DeviceNotFound, "Reader device is not ready.");
             }
 
-            if (!_initialized || _device is null)
-            {
-                return Error(ErrorCode.DeviceOpenFailed, "Device initialization failed.");
-            }
+            ResetWorkingState();
 
-            var cfg = _settings.CurrentValue;
+            var config = _config.CurrentValue;
             using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-            timeoutCts.CancelAfter(TimeSpan.FromSeconds(Math.Max(1, cfg.TimeoutSeconds)));
+            timeoutCts.CancelAfter(TimeSpan.FromSeconds(Math.Max(1, config.TimeoutSeconds)));
 
-            _logger.LogInformation("Read lifecycle started.");
+            var scanTask = new DocScannerTask();
+            scanTask.Add(Light.Infra).Add(Light.White);
+            var page = _pr.Scanner.Scan(scanTask, PagePosition.First);
 
-            var result = await StartReadLifecycleAsync(cfg, timeoutCts.Token);
-            if (result.Status != ErrorCode.None)
+            var engTask = new EngineTask();
+            engTask.Add(FieldSource.Mrz, FieldId.All)
+                .Add(FieldSource.Viz, FieldId.Face)
+                .Add(FieldSource.Viz, FieldId.CAN)
+                .Add(FieldSource.Viz, FieldId.Signature);
+
+            var vizDoc = _pr.Engine.Analyze(page, engTask);
+            _workingResponse.Raw.Mrz = SafeFieldValue(vizDoc, FieldSource.Mrz, FieldId.All);
+            _workingResponse.Raw.Barcode = SafeFieldValue(vizDoc, FieldSource.Barcode, FieldId.All);
+            _mrzString = _workingResponse.Raw.Mrz;
+            _canString = SafeFieldValue(vizDoc, FieldSource.Viz, FieldId.CAN);
+
+            if (config.IncludePhoto)
             {
-                return Error(result.Status, result.Message);
+                _workingResponse.Images.PhotoBase64 = TryImageAsJpegBase64(vizDoc, FieldSource.Viz, FieldId.Face);
             }
 
-            return new ReadResponse
+            var reader = TryConnectCard(out var card);
+            if (reader is null || card is null)
             {
-                Ok = true,
-                InternalCode = ErrorCode.None,
-                Message = "Read completed.",
-                Fields = result.Fields,
-                Raw = result.Raw,
-                Images = result.Images
-            };
+                return ReadResponse.Failure(ResponseCode.NoDocument, "No document detected on any reader.");
+            }
+
+            lock (_stateLock)
+            {
+                _currentCard = card;
+                _currentReadTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            }
+
+            var ecTask = BuildECardTask(config.GetAuthLevelOrDefault());
+            _currentTaskCtrl = reader.StartRead(card, ecTask);
+
+            try
+            {
+                await _currentReadTcs!.Task.WaitAsync(timeoutCts.Token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                var stopTask = _currentTaskCtrl?.Stop();
+                if (stopTask is not null)
+                {
+                    await stopTask.ConfigureAwait(false);
+                }
+
+                return ReadResponse.Failure(ResponseCode.Timeout, "Read operation timed out.");
+            }
+
+            MergeFinalFields(vizDoc);
+
+            _workingResponse.Ok = true;
+            _workingResponse.InternalCode = ResponseCode.Ok;
+            _workingResponse.Message = _authFailed
+                ? "MRZ/VIZ read succeeded; chip authentication failed. Returning partial data."
+                : _receivedFiles.Count == 0
+                    ? "MRZ/VIZ read succeeded; chip data unavailable."
+                    : "Read completed successfully.";
+
+            return _workingResponse;
         }
-        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        catch (NoSuchDevice ex)
         {
-            _logger.LogWarning("Read timed out.");
-            return Error(ErrorCode.Timeout, "Read operation timed out.");
+            _logger.LogError(ex, "No configured device found.");
+            return ReadResponse.Failure(ResponseCode.DeviceNotFound, "Configured device not found.");
+        }
+        catch (DeviceIsDisconnected ex)
+        {
+            _logger.LogError(ex, "Device disconnected.");
+            _deviceReady = false;
+            return ReadResponse.Failure(ResponseCode.DeviceNotFound, "Device disconnected.");
+        }
+        catch (CommunicationError ex)
+        {
+            _logger.LogError(ex, "Communication error while reading chip.");
+            return ReadResponse.Failure(ResponseCode.ChipReadFailed, "Chip communication failed.");
+        }
+        catch (FunctionTimedOut ex)
+        {
+            _logger.LogError(ex, "SDK function timed out.");
+            return ReadResponse.Failure(ResponseCode.Timeout, "Reader operation timed out.");
+        }
+        catch (AuthenticityFailed ex)
+        {
+            _logger.LogError(ex, "Authenticity check failed.");
+            return ReadResponse.Failure(ResponseCode.AuthFailed, "Chip authentication failed.");
+        }
+        catch (InvalidParameter ex)
+        {
+            _logger.LogError(ex, "Invalid parameter passed to SDK.");
+            return ReadResponse.Failure(ResponseCode.ReadFailed, "Reader parameter error.");
+        }
+        catch (General ex)
+        {
+            _logger.LogError(ex, "Pr22 read failure.");
+            return ReadResponse.Failure(ResponseCode.ReadFailed, "Reader operation failed.");
+        }
+        catch (DllNotFoundException ex)
+        {
+            _logger.LogError(ex, "Pr22 runtime missing.");
+            return ReadResponse.Failure(ResponseCode.DeviceOpenFailed, "Passport Reader Software not installed or wrong bitness (x64 required).");
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Unhandled read failure.");
-            return Error(ErrorCode.ReadFailed, ex.Message);
+            return ReadResponse.Failure(ResponseCode.ReadFailed, "Unexpected read failure.");
         }
         finally
         {
-            CleanupCardAndControl();
-            _readLock.Release();
+            await CleanupCurrentReadAsync().ConfigureAwait(false);
+            _readSemaphore.Release();
         }
     }
 
-    private async Task<GatewayReadResult> StartReadLifecycleAsync(AppSettings cfg, CancellationToken cancellationToken)
+    private void TryOpenConfiguredDevice()
     {
-        lock (_sync)
+        if (_pr is null)
         {
-            EnsureDeviceConnected();
-            if (_device is null)
-            {
-                return GatewayReadResult.Fail(ErrorCode.DeviceNotFound, "Device not found.");
-            }
-
-            _reader = _device.Readers.FirstOrDefault();
-            if (_reader is null)
-            {
-                return GatewayReadResult.Fail(ErrorCode.NoDocument, "No e-card reader found.");
-            }
-
-            var cards = _reader.GetCards();
-            if (cards.Count == 0)
-            {
-                return GatewayReadResult.Fail(ErrorCode.NoDocument, "No document/card present.");
-            }
-
-            _card = _reader.ConnectCard(0);
+            return;
         }
 
-        if (_device is null || _reader is null || _card is null)
-        {
-            return GatewayReadResult.Fail(ErrorCode.ReadFailed, "Reader/card initialization failed.");
-        }
-
-        var scanTask = new DocScannerTask();
-        scanTask.Add(Light.Infra).Add(Light.White);
-        var page = _device.Scanner.Scan(scanTask, PagePosition.First);
-
-        var engineTask = new EngineTask();
-        engineTask.Add(FieldSource.Mrz, FieldId.All);
-        engineTask.Add(FieldSource.Viz, FieldId.CAN);
-        engineTask.Add(new FieldReference(FieldSource.Viz, FieldId.Face));
-
-        _vizResult = _device.Engine.Analyze(page, engineTask);
-
-        var readTask = new ECardTask
-        {
-            AuthLevel = AuthLevel.Full
-        };
-        readTask.Add(FileId.All);
-
-        _readFinishedTcs = new TaskCompletionSource<GatewayReadResult>(TaskCreationOptions.RunContinuationsAsynchronously);
-
-        _logger.LogInformation("Starting card read with AuthLevel.Full and FileId.All.");
-        _readControl = _reader.StartRead(_card, readTask);
-
-        await using var reg = cancellationToken.Register(() => _readFinishedTcs.TrySetCanceled(cancellationToken));
-        return await _readFinishedTcs.Task;
-    }
-
-    private void OpenConfiguredDevice()
-    {
-        if (_device is null)
-        {
-            throw new InvalidOperationException("SDK device is not initialized.");
-        }
-
-        var deviceName = _settings.CurrentValue.DeviceName?.Trim();
+        var configuredDevice = _config.CurrentValue.DeviceName?.Trim();
         var devices = DocumentReaderDevice.GetDeviceList();
 
-        if (devices.Count == 0)
+        if (string.IsNullOrWhiteSpace(configuredDevice) || !devices.Contains(configuredDevice, StringComparer.Ordinal))
         {
-            throw new InvalidOperationException("No connected reader devices detected.");
-        }
-
-        var selected = devices.FirstOrDefault(d => string.Equals(d, deviceName, StringComparison.OrdinalIgnoreCase))
-                       ?? devices.First();
-
-        _device.UseDevice(selected);
-        _logger.LogInformation("Using reader device: {DeviceName}", selected);
-    }
-
-    private void EnsureDeviceConnected()
-    {
-        if (_device is null)
-        {
+            _deviceReady = false;
+            _logger.LogError("Configured device '{DeviceName}' not found in available list.", configuredDevice);
             return;
         }
 
-        try
-        {
-            _ = _device.Readers;
-        }
-        catch (General)
-        {
-            _logger.LogWarning("Reader disconnected. Attempting reopen.");
-            OpenConfiguredDevice();
-        }
+        _pr.UseDevice(configuredDevice);
+        _deviceReady = true;
+        _logger.LogInformation("Reader opened: {DeviceName}", configuredDevice);
     }
 
-    private void OnConnection(object? sender, ConnectionEventArgs e)
+    private ECardReader? TryConnectCard(out ECard? card)
     {
-        _logger.LogInformation("Connection state changed: {Connection}", e.Connection);
-    }
-
-    private void OnAuthBegin(object? sender, AuthEventArgs e)
-    {
-        _logger.LogInformation("AuthBegin: {Auth}", e.Authentication);
-    }
-
-    private void OnAuthFinished(object? sender, AuthEventArgs e)
-    {
-        _logger.LogInformation("AuthFinished: {Auth}, result: {Result}", e.Authentication, e.Result);
-
-        if (e.Result != ErrorCodes.ENOERR)
+        card = null;
+        if (_pr is null)
         {
-            _readFinishedTcs?.TrySetResult(GatewayReadResult.Fail(ErrorCode.ReadFailed, $"Chip authentication failed: {e.Result}"));
-        }
-    }
-
-    private void OnAuthWaitForInput(object? sender, AuthEventArgs e)
-    {
-        _logger.LogInformation("AuthWaitForInput: {Auth}", e.Authentication);
-
-        if (_card is null || _vizResult is null)
-        {
-            _readFinishedTcs?.TrySetResult(GatewayReadResult.Fail(ErrorCode.ReadFailed, "Authentication context not ready."));
-            return;
+            return null;
         }
 
-        BinData? authData = null;
-        var selector = 0;
-
-        if (e.Authentication is AuthProcess.BAC or AuthProcess.BAP or AuthProcess.PACE)
+        foreach (var reader in _pr.Readers)
         {
-            var mrzRef = new FieldReference(FieldSource.Mrz, FieldId.All);
-            var canRef = new FieldReference(FieldSource.Viz, FieldId.CAN);
-
-            if (_vizResult.GetFields(mrzRef).Count > 0)
+            try
             {
-                authData = new BinData();
-                authData.SetString(_vizResult.GetField(mrzRef).GetBestStringValue());
-                selector = 1;
+                card = reader.ConnectCard(0);
+                return reader;
             }
-            else if (_vizResult.GetFields(canRef).Count > 0)
+            catch (Exception ex)
             {
-                authData = new BinData();
-                authData.SetString(_vizResult.GetField(canRef).GetBestStringValue());
-                selector = 2;
+                _logger.LogDebug(ex, "ConnectCard failed on reader {ReaderType}", reader.Info.HwType);
             }
-        }
-
-        try
-        {
-            _card.Authenticate(e.Authentication, authData, selector);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Authenticate failed for {Auth}", e.Authentication);
-            _readFinishedTcs?.TrySetResult(GatewayReadResult.Fail(ErrorCode.ReadFailed, "Chip authentication failed."));
-        }
-    }
-
-    private void OnReadBegin(object? sender, FileEventArgs e)
-    {
-        _logger.LogInformation("ReadBegin: {FileId}", e.FileId);
-    }
-
-    private void OnReadFinished(object? sender, FileEventArgs e)
-    {
-        _logger.LogInformation("ReadFinished: {FileId}, result: {Result}", e.FileId, e.Result);
-
-        if (e.Result != ErrorCodes.ENOERR && e.FileId.Id == (int)FileId.All)
-        {
-            _readFinishedTcs?.TrySetResult(GatewayReadResult.Fail(ErrorCode.ReadFailed, $"Read failed: {e.Result}"));
-            return;
-        }
-
-        if (e.FileId.Id != (int)FileId.All || _device is null || _card is null)
-        {
-            return;
-        }
-
-        try
-        {
-            var payload = BuildResult(_device, _card, _settings.CurrentValue.IncludePhoto);
-            _readFinishedTcs?.TrySetResult(payload);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Failed building read payload.");
-            _readFinishedTcs?.TrySetResult(GatewayReadResult.Fail(ErrorCode.ReadFailed, "Failed extracting fields."));
-        }
-    }
-
-    private void OnFileChecked(object? sender, FileEventArgs e)
-    {
-        _logger.LogInformation("FileChecked: {FileId}, result: {Result}", e.FileId, e.Result);
-    }
-
-    private GatewayReadResult BuildResult(DocumentReaderDevice device, ECard card, bool includePhoto)
-    {
-        var fileData = card.GetFile(FileId.All);
-        var document = device.Engine.Analyze(fileData);
-
-        var fields = new ReadFields
-        {
-            FullNameAr = GetFieldBest(document, FieldSource.Viz, FieldId.Name),
-            FullNameLat = GetFieldBest(document, FieldSource.Mrz, FieldId.Name),
-            Dob = GetFieldBest(document, FieldSource.Mrz, FieldId.BirthDate),
-            Sex = GetFieldBest(document, FieldSource.Mrz, FieldId.Sex),
-            DocNo = GetFieldBest(document, FieldSource.Mrz, FieldId.DocumentNumber),
-            Nin = GetFieldBest(document, FieldSource.Viz, FieldId.OptionalData),
-            Address = GetFieldBest(document, FieldSource.Viz, FieldId.Address),
-            IssueDate = GetFieldBest(document, FieldSource.Viz, FieldId.IssueDate),
-            ExpiryDate = GetFieldBest(document, FieldSource.Mrz, FieldId.ExpiryDate)
-        };
-
-        var raw = new RawPayload
-        {
-            Mrz = GetFieldRaw(document, FieldSource.Mrz, FieldId.All),
-            Barcode = GetFieldRaw(document, FieldSource.Viz, FieldId.Barcode)
-        };
-
-        var images = new ImagePayload();
-        if (includePhoto)
-        {
-            var face = TryGetFaceImageBase64(document) ?? string.Empty;
-            images.PhotoBase64 = face;
-            images.PhotoMime = "image/jpeg";
-        }
-
-        return new GatewayReadResult
-        {
-            Status = ErrorCode.None,
-            Message = "Read completed.",
-            Fields = fields,
-            Raw = raw,
-            Images = images
-        };
-    }
-
-    private static string? TryGetFaceImageBase64(Processing.Document doc)
-    {
-        // Priority: DG2 face, fallback: VIZ face
-        var dg2Ref = new FieldReference(FieldSource.ECard, FieldId.Face);
-        if (doc.GetFields().Contains(dg2Ref))
-        {
-            return Convert.ToBase64String(doc.GetField(dg2Ref).GetImage().Save(Image.FileFormat.Jpeg).GetBytes());
-        }
-
-        var vizRef = new FieldReference(FieldSource.Viz, FieldId.Face);
-        if (doc.GetFields().Contains(vizRef))
-        {
-            return Convert.ToBase64String(doc.GetField(vizRef).GetImage().Save(Image.FileFormat.Jpeg).GetBytes());
         }
 
         return null;
     }
 
-    private static string GetFieldBest(Processing.Document doc, FieldSource source, FieldId id)
+    private static ECardTask BuildECardTask(AuthLevel level)
     {
+        var ecTask = new ECardTask
+        {
+            AuthLevel = level
+        };
+
+        ecTask.Add(FileId.All)
+            .Add(FileId.PersonalDetails)
+            .Add(FileId.GeneralData)
+            .Add(FileId.DomesticData)
+            .Add(FileId.IssuerDetails)
+            .Add(FileId.AnyFace)
+            .Add(FileId.Signature);
+
         try
         {
-            return doc.GetField(source, id).GetBestStringValue();
+            ecTask.Add(FileId.Sod)
+                .Add(FileId.CardAccess)
+                .Add(FileId.CardSecurity);
         }
         catch
         {
-            return string.Empty;
         }
+
+        return ecTask;
     }
 
-    private static string GetFieldRaw(Processing.Document doc, FieldSource source, FieldId id)
+    private async Task CleanupCurrentReadAsync()
     {
-        try
-        {
-            return doc.GetField(source, id).GetRawStringValue();
-        }
-        catch
-        {
-            return string.Empty;
-        }
-    }
+        Task? stopTask = null;
+        ECard? card = null;
 
-    private void CleanupCardAndControl()
-    {
-        try
+        lock (_stateLock)
         {
-            _readControl?.Stop().Wait(TimeSpan.FromSeconds(1));
-        }
-        catch
-        {
-            // Ignore stop cleanup errors.
+            if (_currentTaskCtrl is not null)
+            {
+                stopTask = _currentTaskCtrl.Stop();
+            }
+
+            card = _currentCard;
+            _currentTaskCtrl = null;
+            _currentCard = null;
+            _currentReadTcs = null;
         }
 
-        _readControl = null;
-
-        try
+        if (stopTask is not null)
         {
-            _card?.Disconnect();
-        }
-        catch
-        {
-            // Ignore disconnect cleanup errors.
+            await stopTask.ConfigureAwait(false);
         }
 
-        _card = null;
-        _reader = null;
-        _vizResult = null;
-        _readFinishedTcs = null;
-    }
-
-    private static ReadResponse Error(ErrorCode code, string message) => new()
-    {
-        Ok = false,
-        InternalCode = code,
-        Message = message
-    };
-
-    public void Dispose()
-    {
-        CleanupCardAndControl();
-
-        if (_device is not null)
+        if (card is not null)
         {
             try
             {
-                _device.Close();
+                card.Disconnect();
             }
             catch
             {
-                // ignored
+            }
+
+            card.Dispose();
+        }
+    }
+
+    private void ResetWorkingState()
+    {
+        _mrzString = null;
+        _canString = null;
+        _chipDocs.Clear();
+        _authFailed = false;
+
+        lock (_resultLock)
+        {
+            _requestedFiles.Clear();
+            _receivedFiles.Clear();
+            _workingResponse = new ReadResponse();
+        }
+    }
+
+    private void MergeFinalFields(Pr22.Processing.Document vizDoc)
+    {
+        lock (_resultLock)
+        {
+            var chipFields = BuildChipAggregateFields();
+
+            _workingResponse.Fields.FullNameLat = FirstNonEmpty(
+                chipFields.SurnameGiven,
+                BuildLatNameFromViz(vizDoc));
+
+            _workingResponse.Fields.FullNameAr = chipFields.FullNameAr;
+            _workingResponse.Fields.Dob = FirstNonEmpty(chipFields.BirthDate, NormalizeDate(SafeFieldValue(vizDoc, FieldSource.Mrz, FieldId.BirthDate)));
+            _workingResponse.Fields.Sex = FirstNonEmpty(chipFields.Sex, SafeFieldValue(vizDoc, FieldSource.Mrz, FieldId.Sex));
+            _workingResponse.Fields.DocNo = FirstNonEmpty(chipFields.DocumentNumber, SafeFieldValue(vizDoc, FieldSource.Mrz, FieldId.DocumentNumber));
+            _workingResponse.Fields.Nin = chipFields.PersonalNumber;
+            _workingResponse.Fields.Address = chipFields.Address;
+            _workingResponse.Fields.IssueDate = chipFields.IssueDate;
+            _workingResponse.Fields.ExpiryDate = FirstNonEmpty(chipFields.ExpiryDate, NormalizeDate(SafeFieldValue(vizDoc, FieldSource.Mrz, FieldId.ExpiryDate)));
+
+            if (_config.CurrentValue.IncludePhoto && string.IsNullOrWhiteSpace(_workingResponse.Images.PhotoBase64))
+            {
+                _workingResponse.Images.PhotoBase64 = TryImageAsJpegBase64(vizDoc, FieldSource.Viz, FieldId.Face);
+            }
+        }
+    }
+
+    private ChipAggregate BuildChipAggregateFields()
+    {
+        var aggregate = new ChipAggregate();
+
+        foreach (var doc in _chipDocs.Values)
+        {
+            aggregate.FullNameAr = FirstNonEmpty(aggregate.FullNameAr, SafeFieldValue(doc, FieldSource.Rfid, FieldId.Name));
+            aggregate.Surname = FirstNonEmpty(aggregate.Surname, SafeFieldValue(doc, FieldSource.Rfid, FieldId.Surname));
+            aggregate.GivenName = FirstNonEmpty(aggregate.GivenName, SafeFieldValue(doc, FieldSource.Rfid, FieldId.GivenName));
+            aggregate.BirthDate = FirstNonEmpty(aggregate.BirthDate, NormalizeDate(SafeFieldValue(doc, FieldSource.Rfid, FieldId.BirthDate)));
+            aggregate.Sex = FirstNonEmpty(aggregate.Sex, SafeFieldValue(doc, FieldSource.Rfid, FieldId.Sex));
+            aggregate.DocumentNumber = FirstNonEmpty(aggregate.DocumentNumber, SafeFieldValue(doc, FieldSource.Rfid, FieldId.DocumentNumber));
+            aggregate.PersonalNumber = FirstNonEmpty(aggregate.PersonalNumber, SafeFieldValue(doc, FieldSource.Rfid, FieldId.PersonalNumber));
+            aggregate.Address = FirstNonEmpty(aggregate.Address, SafeFieldValue(doc, FieldSource.Rfid, FieldId.Address));
+            aggregate.IssueDate = FirstNonEmpty(aggregate.IssueDate, NormalizeDate(SafeFieldValue(doc, FieldSource.Rfid, FieldId.IssueDate)));
+            aggregate.ExpiryDate = FirstNonEmpty(aggregate.ExpiryDate, NormalizeDate(SafeFieldValue(doc, FieldSource.Rfid, FieldId.ExpiryDate)));
+
+            if (_config.CurrentValue.IncludePhoto && string.IsNullOrWhiteSpace(_workingResponse.Images.PhotoBase64))
+            {
+                _workingResponse.Images.PhotoBase64 = TryImageAsJpegBase64(doc, FieldSource.Rfid, FieldId.Face);
             }
         }
 
-        _readLock.Dispose();
+        aggregate.SurnameGiven = string.Join(
+            " ",
+            new[] { aggregate.Surname, aggregate.GivenName }.Where(static x => !string.IsNullOrWhiteSpace(x))).Trim();
+
+        return aggregate;
     }
 
-    private sealed class GatewayReadResult
+    private static string BuildLatNameFromViz(Pr22.Processing.Document vizDoc)
     {
-        public ErrorCode Status { get; init; }
-        public string Message { get; init; } = string.Empty;
-        public ReadFields Fields { get; init; } = new();
-        public RawPayload Raw { get; init; } = new();
-        public ImagePayload Images { get; init; } = new();
+        var surname = SafeFieldValue(vizDoc, FieldSource.Mrz, FieldId.Surname);
+        var givenName = SafeFieldValue(vizDoc, FieldSource.Mrz, FieldId.GivenName);
+        return string.Join(" ", new[] { surname, givenName }.Where(static x => !string.IsNullOrWhiteSpace(x))).Trim();
+    }
 
-        public static GatewayReadResult Fail(ErrorCode code, string message) => new()
+    private static string NormalizeDate(string value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
         {
-            Status = code,
-            Message = message
-        };
+            return string.Empty;
+        }
+
+        var clean = value.Trim();
+
+        if (DateTime.TryParse(clean, out var date))
+        {
+            return date.ToString("yyyy-MM-dd");
+        }
+
+        if (clean.Length == 8 && DateTime.TryParseExact(clean, "yyyyMMdd", null, System.Globalization.DateTimeStyles.None, out date))
+        {
+            return date.ToString("yyyy-MM-dd");
+        }
+
+        if (clean.Length == 6 && DateTime.TryParseExact(clean, "yyMMdd", null, System.Globalization.DateTimeStyles.None, out date))
+        {
+            return date.ToString("yyyy-MM-dd");
+        }
+
+        return clean;
+    }
+
+    private static string FirstNonEmpty(params string[] values)
+        => values.FirstOrDefault(static x => !string.IsNullOrWhiteSpace(x)) ?? string.Empty;
+
+    private static string SafeFieldValue(Pr22.Processing.Document doc, FieldSource source, FieldId fieldId)
+    {
+        try
+        {
+            return doc.GetField(source, fieldId).Value ?? string.Empty;
+        }
+        catch
+        {
+            return string.Empty;
+        }
+    }
+
+    private static string TryImageAsJpegBase64(Pr22.Processing.Document document, FieldSource source, FieldId fieldId)
+    {
+        try
+        {
+            var image = document.GetField(source, fieldId).GetImage().ToBitmap();
+            using var memory = new MemoryStream();
+            image.Save(memory, ImageFormat.Jpeg);
+            return Convert.ToBase64String(memory.ToArray());
+        }
+        catch
+        {
+            return string.Empty;
+        }
+    }
+
+    private void OnConnection(object? sender, ConnectionEventArgs e)
+    {
+        if (e.DeviceNumber > 0)
+        {
+            _logger.LogInformation("Device connected event received. DeviceNumber={DeviceNumber}", e.DeviceNumber);
+            if (!_deviceReady)
+            {
+                TryOpenConfiguredDevice();
+            }
+
+            return;
+        }
+
+        _deviceReady = false;
+        _logger.LogWarning("Device disconnected event received.");
+    }
+
+    private void OnAuthBegin(object? sender, AuthEventArgs e)
+    {
+        _logger.LogInformation("AuthBegin {AuthProcess}", e.Authentication);
+    }
+
+    private void OnAuthFinished(object? sender, AuthEventArgs e)
+    {
+        _logger.LogInformation("AuthFinished {AuthProcess} => {Result}", e.Authentication, e.Result);
+        if (e.Result != ErrorCodes.ENOERR)
+        {
+            _authFailed = true;
+        }
+    }
+
+    private void OnAuthWaitForInput(object? sender, AuthEventArgs e)
+    {
+        _logger.LogInformation("AuthWaitForInput {AuthProcess}", e.Authentication);
+
+        try
+        {
+            BinData authData;
+            if (!string.IsNullOrWhiteSpace(_mrzString))
+            {
+                authData = new BinData(Encoding.ASCII.GetBytes(_mrzString));
+            }
+            else if (!string.IsNullOrWhiteSpace(_canString))
+            {
+                authData = new BinData(Encoding.ASCII.GetBytes(_canString));
+            }
+            else
+            {
+                authData = e.Card.GetAuthReferenceData();
+            }
+
+            e.Card.Authenticate(e.Authentication, authData, 0);
+        }
+        catch (Exception ex)
+        {
+            _authFailed = true;
+            _logger.LogError(ex, "Authentication callback failed for {Auth}", e.Authentication);
+        }
+    }
+
+    private void OnReadBegin(object? sender, FileEventArgs e)
+    {
+        lock (_resultLock)
+        {
+            _requestedFiles.Add(e.FileId.ToString());
+        }
+
+        _logger.LogInformation("ReadBegin {FileId}", e.FileId);
+    }
+
+    private void OnReadFinished(object? sender, FileEventArgs e)
+    {
+        _logger.LogInformation("ReadFinished {FileId} => {Result}", e.FileId, e.Result);
+
+        lock (_resultLock)
+        {
+            _receivedFiles.Add(e.FileId.ToString());
+        }
+
+        if (e.Result == ErrorCodes.ENOERR)
+        {
+            try
+            {
+                var raw = e.Card.GetFile(e.FileId);
+                if (raw is not null && _pr is not null)
+                {
+                    var doc = _pr.Engine.Analyze(raw);
+                    _chipDocs[e.FileId.ToString()] = doc;
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to parse file {FileId}", e.FileId);
+            }
+        }
+
+        if (e.FileId.Id == (int)FileId.All && e.Result == ErrorCodes.ENOERR)
+        {
+            _currentReadTcs?.TrySetResult(true);
+            return;
+        }
+
+        if (e.FileId.Id == (int)FileId.All && e.Result != ErrorCodes.ENOERR)
+        {
+            _currentReadTcs?.TrySetResult(true);
+        }
+    }
+
+    private void OnFileChecked(object? sender, FileEventArgs e)
+    {
+        _logger.LogInformation("FileChecked {FileId} => {Result}", e.FileId, e.Result);
+    }
+
+    public void Dispose()
+    {
+        _readSemaphore.Dispose();
+    }
+
+    private sealed class ChipAggregate
+    {
+        public string FullNameAr { get; set; } = string.Empty;
+        public string Surname { get; set; } = string.Empty;
+        public string GivenName { get; set; } = string.Empty;
+        public string SurnameGiven { get; set; } = string.Empty;
+        public string BirthDate { get; set; } = string.Empty;
+        public string Sex { get; set; } = string.Empty;
+        public string DocumentNumber { get; set; } = string.Empty;
+        public string PersonalNumber { get; set; } = string.Empty;
+        public string Address { get; set; } = string.Empty;
+        public string IssueDate { get; set; } = string.Empty;
+        public string ExpiryDate { get; set; } = string.Empty;
     }
 }

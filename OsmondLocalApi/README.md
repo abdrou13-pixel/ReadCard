@@ -1,23 +1,19 @@
 # OsmondLocalApi
 
-Windows Service (.NET 8, x64) exposing local-only HTTP API for Algerian biometric ID/passport reading through Adaptive Recognition `pr-sdk-2.2` and Osmond R V2.
+Production-grade .NET 8 x64 Windows Service exposing a local-only HTTP API to read Algerian biometric ID cards and passports using Adaptive Recognition Passport Reader Software (`Pr22.dll`).
 
-## Runtime requirements
+## Runtime prerequisites
 
-- Windows 10/11 x64
-- Passport Reader Software installed
-- `pr-sdk-2.2` .NET assemblies available
-- Reader connected via USB
-
-## Project structure
-
-- `Program.cs`: Minimal API + Windows Service hosting + ProgramData config/logging
-- `Services/OsmondReaderService.cs`: PR22 lifecycle orchestration (scan/analyze/auth/read/extract)
-- `Models/ReadResponse.cs`: required output schema
+1. Windows 10/11 x64.
+2. Passport Reader Software installed (x64).
+3. SDK binaries available in `lib\pr-sdk-2.2`:
+   - `Pr22.dll`
+   - `Pr22.Processing.dll`
+4. Device connected by USB.
 
 ## Configuration
 
-File path:
+Config file is loaded from:
 
 `%ProgramData%\OsmondLocalApi\appsettings.json`
 
@@ -27,120 +23,109 @@ File path:
   "timeoutSeconds": 10,
   "includePhoto": true,
   "deviceName": "Osmond R V2 SN1234",
-  "apiKey": "optional-api-key"
+  "apiKey": "",
+  "authLevel": "Opt"
 }
 ```
 
-## Logging
+- `authLevel`: `Min | Opt | Max`.
+- if `apiKey` is set, client must send `X-API-Key`.
 
-Daily rolling logs written to:
+## Build and publish
 
-`%ProgramData%\OsmondLocalApi\logs`
-
-## Endpoint
-
-### POST `http://127.0.0.1:8765/read`
-
-- Optional header: `X-API-Key` (required when configured)
-- If read already in progress: HTTP 409 + `READ_IN_PROGRESS`
-
-### Response
-
-```json
-{
-  "ok": true,
-  "code": "",
-  "message": "Read completed.",
-  "fields": {
-    "full_name_ar": "",
-    "full_name_lat": "",
-    "dob": "",
-    "sex": "",
-    "doc_no": "",
-    "nin": "",
-    "address": "",
-    "issue_date": "",
-    "expiry_date": ""
-  },
-  "raw": {
-    "mrz": "",
-    "barcode": ""
-  },
-  "images": {
-    "photo_base64": "",
-    "photo_mime": "image/jpeg"
-  }
-}
+```bash
+dotnet publish -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true
 ```
 
-## PR22 integration behavior implemented
+Published binary location:
+`bin\Release\net8.0-windows\win-x64\publish\OsmondLocalApi.exe`
 
-- Device opened on startup and reused.
-- Read pipeline:
-  1) Scan White + Infra
-  2) Analyze MRZ + VIZ
-  3) Start `ECardTask` with `AuthLevel.Full` and `FileId.All`
-  4) Handle `AuthBegin`, `AuthWaitForInput`, `AuthFinished`
-  5) Await `ReadFinished(FileId.All)` via `TaskCompletionSource`
-  6) Extract output fields and raw values
-- Chip auth failure returns `READ_FAILED`.
-- Photo selection priority: DG2 face (`FieldSource.ECard`) then fallback VIZ face.
+## Install as Windows Service
 
-## SDK binary placement
-
-Put these files under:
-
-`lib\pr-sdk-2.2\`
-
-- `Pr22.dll`
-- `Pr22.Processing.dll`
-
-## Publish self-contained x64
-
-```powershell
-dotnet restore
-dotnet publish .\OsmondLocalApi.csproj -c Release -r win-x64 --self-contained true /p:PublishSingleFile=true -o .\publish
-```
-
-}0211
-47## Register Windows Service (sc.exe)
-
-```powershell
-sc.exe create OsmondLocalApi binPath= "C:\Program Files\OsmondLocalApi\OsmondLocalApi.exe" start= auto
-sc.exe description OsmondLocalApi "Local API for Algerian eID/passport read via Osmond R V2"
+```bat
+sc.exe create OsmondLocalApi binPath= "C:\Services\OsmondLocalApi\OsmondLocalApi.exe" start= auto
+sc.exe description OsmondLocalApi "Local Pr22 biometric reader API"
 sc.exe start OsmondLocalApi
 ```
 
-## PHP cURL example
+Uninstall:
+
+```bat
+sc.exe stop OsmondLocalApi
+sc.exe delete OsmondLocalApi
+```
+
+## API
+
+### POST `http://127.0.0.1:8765/read`
+
+Returns consistent schema:
+
+- `ok`
+- `code` (`OK`, `DEVICE_NOT_FOUND`, `AUTH_FAILED`, ...)
+- `fields`
+- `raw`
+- `images`
+
+If a read is already running, returns HTTP `409` with `READ_IN_PROGRESS`.
+
+## Integration samples
+
+### PHP (cURL)
 
 ```php
 <?php
 $ch = curl_init('http://127.0.0.1:8765/read');
-curl_setopt($ch, CURLOPT_POST, true);
-curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-curl_setopt($ch, CURLOPT_HTTPHEADER, [
-    'Content-Type: application/json',
-    'X-API-Key: optional-api-key'
+curl_setopt_array($ch, [
+    CURLOPT_POST => true,
+    CURLOPT_RETURNTRANSFER => true,
+    CURLOPT_HTTPHEADER => [
+        'Content-Type: application/json',
+        'X-API-Key: your-key-if-configured'
+    ],
+    CURLOPT_TIMEOUT => 20,
 ]);
-curl_setopt($ch, CURLOPT_POSTFIELDS, '{}');
 $response = curl_exec($ch);
 $status = curl_getinfo($ch, CURLINFO_HTTP_CODE);
 curl_close($ch);
-
-echo "HTTP $status\n";
-echo $response;
+echo "HTTP $status\n$response\n";
 ```
 
-## Python (Odoo requests) example
+### Python (Odoo style)
 
-```p2ython
+```python
 import requests
 
-resp = requests.post(
-    "http://127.0.0.1:8765/read",
-    json={},
-    headers={"X-API-Key": "optional-api-key"},
-    timeout=20,
-)
-print(resp.status_code, resp.json())
+url = "http://127.0.0.1:8765/read"
+headers = {"X-API-Key": "your-key-if-configured"}
+res = requests.post(url, headers=headers, timeout=20)
+res.raise_for_status()
+data = res.json()
+print(data["code"], data["fields"].get("doc_no"))
 ```
+
+### VB6 / Forms6 pseudo-code
+
+```vb
+Dim http As Object
+Dim body As String
+
+Set http = CreateObject("MSXML2.ServerXMLHTTP")
+http.Open "POST", "http://127.0.0.1:8765/read", False
+http.setRequestHeader "Content-Type", "application/json"
+http.setRequestHeader "X-API-Key", "your-key-if-configured"
+http.send "{}"
+
+If http.Status = 200 Then
+    body = http.responseText
+    MsgBox body
+Else
+    MsgBox "Read failed: HTTP " & CStr(http.Status) & vbCrLf & http.responseText
+End If
+```
+
+## Notes
+
+- The service binds only to loopback (`127.0.0.1`).
+- Logs are written to `%ProgramData%\OsmondLocalApi\logs\log-*.txt`.
+- Sensitive values (photo bytes/full NIN) are intentionally not logged.

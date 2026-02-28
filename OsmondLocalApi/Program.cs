@@ -1,5 +1,7 @@
+using System.Net;
 using System.Text.Json;
-using OsmondLocalApi.Config;
+using Microsoft.Extensions.Options;
+using OsmondLocalApi.Middleware;
 using OsmondLocalApi.Models;
 using OsmondLocalApi.Services;
 using Serilog;
@@ -14,8 +16,8 @@ Directory.CreateDirectory(logsPath);
 
 if (!File.Exists(configPath))
 {
-    var defaultConfig = JsonSerializer.Serialize(new AppSettings(), new JsonSerializerOptions { WriteIndented = true });
-    File.WriteAllText(configPath, defaultConfig);
+    var bootstrapConfig = new AppConfig();
+    File.WriteAllText(configPath, JsonSerializer.Serialize(bootstrapConfig, new JsonSerializerOptions { WriteIndented = true }));
 }
 
 var builder = WebApplication.CreateBuilder(args);
@@ -23,74 +25,54 @@ var builder = WebApplication.CreateBuilder(args);
 builder.Configuration
     .SetBasePath(appRoot)
     .AddJsonFile(configPath, optional: false, reloadOnChange: true)
-    .AddEnvironmentVariables(prefix: "OSMOND_LOCAL_API_");
+    .AddEnvironmentVariables(prefix: "OSMONDLOCALAPI_");
 
-builder.Services.Configure<AppSettings>(builder.Configuration);
-builder.Services.AddSingleton<IOsmondReaderService, OsmondReaderService>();
-builder.Services.AddHostedService<ReaderHostedService>();
+builder.Services.Configure<AppConfig>(builder.Configuration);
+builder.Services.AddSingleton<OsmondReaderService>();
+builder.Services.AddSingleton<IOsmondReaderService>(sp => sp.GetRequiredService<OsmondReaderService>());
+builder.Services.AddHostedService(sp => sp.GetRequiredService<OsmondReaderService>());
 
 Log.Logger = new LoggerConfiguration()
     .ReadFrom.Configuration(builder.Configuration)
     .Enrich.FromLogContext()
-    .WriteTo.Async(cfg => cfg.File(
-        path: Path.Combine(logsPath, "osmondlocalapi-.log"),
-        rollingInterval: RollingInterval.Day,
-        retainedFileCountLimit: 30,
-        shared: true))
+    .WriteTo.RollingFile(Path.Combine(logsPath, "log-{Date}.txt"))
     .CreateLogger();
 
-builder.Host
-    .UseSerilog()
-    .UseWindowsService(options =>
-    {
-        options.ServiceName = "OsmondLocalApi";
-    });
+builder.Host.UseSerilog();
+builder.Host.UseWindowsService(options => options.ServiceName = "OsmondLocalApi");
 
-var appSettings = builder.Configuration.Get<AppSettings>() ?? new AppSettings();
-
-builder.WebHost.ConfigureKestrel(options =>
+builder.WebHost.ConfigureKestrel((context, options) =>
 {
-    options.ListenLocalhost(appSettings.Port);
+    var config = context.Configuration.Get<AppConfig>() ?? new AppConfig();
+    options.Listen(IPAddress.Loopback, config.Port);
 });
 
 var app = builder.Build();
+app.UseMiddleware<ApiKeyMiddleware>();
 
-app.MapPost("/read", async (HttpContext context, IOsmondReaderService readerService, CancellationToken cancellationToken) =>
+app.MapPost("/read", async (IOsmondReaderService reader, HttpContext context, CancellationToken ct) =>
 {
-    var cfg = context.RequestServices.GetRequiredService<IConfiguration>().Get<AppSettings>() ?? new AppSettings();
-    var apiKey = cfg.ApiKey?.Trim();
+    var response = await reader.ReadAsync(ct);
 
-    if (!string.IsNullOrWhiteSpace(apiKey))
+    var status = response.InternalCode switch
     {
-        var provided = context.Request.Headers["X-API-Key"].FirstOrDefault();
-        if (!string.Equals(apiKey, provided, StringComparison.Ordinal))
-        {
-            return Results.Json(new ReadResponse
-            {
-                Ok = false,
-                InternalCode = ErrorCode.Unauthorized,
-                Message = "Invalid API key."
-            }, statusCode: StatusCodes.Status401Unauthorized);
-        }
-    }
+        ResponseCode.Ok => StatusCodes.Status200OK,
+        ResponseCode.ReadInProgress => StatusCodes.Status409Conflict,
+        ResponseCode.Unauthorized => StatusCodes.Status401Unauthorized,
+        ResponseCode.NoDocument => StatusCodes.Status404NotFound,
+        ResponseCode.Timeout => StatusCodes.Status408RequestTimeout,
+        ResponseCode.DeviceNotFound or ResponseCode.DeviceOpenFailed => StatusCodes.Status503ServiceUnavailable,
+        _ => StatusCodes.Status500InternalServerError
+    };
 
-    var result = await readerService.ReadAsync(cancellationToken);
-
-    if (result.InternalCode == ErrorCode.ReadInProgress)
-    {
-        return Results.Json(result, statusCode: StatusCodes.Status409Conflict);
-    }
-
-    if (!result.Ok)
-    {
-        return Results.Json(result, statusCode: StatusCodes.Status500InternalServerError);
-    }
-
-    return Results.Json(result, statusCode: StatusCodes.Status200OK);
+    return Results.Json(response, statusCode: status);
 });
 
-app.MapGet("/health", () => Results.Ok(new { ok = true }));
-
-Log.Information("Starting OsmondLocalApi on 127.0.0.1:{Port}", appSettings.Port);
+app.MapGet("/health", (IOptionsSnapshot<AppConfig> cfg) => Results.Ok(new
+{
+    ok = true,
+    port = cfg.Value.Port,
+    timeoutSeconds = cfg.Value.TimeoutSeconds
+}));
 
 await app.RunAsync();
